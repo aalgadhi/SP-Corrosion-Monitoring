@@ -10,29 +10,28 @@ Usage:
 import argparse
 import asyncio
 import random
-import sys
 from datetime import datetime, timedelta, timezone
 
 import httpx
 
 RANGES = {
     "normal": {
-        "h2s": (0, 20), "co": (0, 50), "ch4": (0, 10), "o2": (19.5, 21.0),
+        "h2s": (0, 20), "co": (0, 50), "co2": (300, 800), "ch4": (0, 10), "o2": (19.5, 21.0),
         "flow_rate": (0.5, 1.0), "temperature": (40, 80), "pressure": (2, 6),
+        "humidity": (30, 55),
     },
     "corrosion": {
-        "h2s": (40, 80), "co": (30, 70), "ch4": (5, 15), "o2": (16, 18),
-        "flow_rate": (0.4, 0.8), "temperature": (55, 95), "pressure": (2.5, 5.5),
-    },
-    "fouling": {
-        "h2s": (5, 25), "co": (10, 40), "ch4": (20, 40), "o2": (18.5, 20.5),
-        "flow_rate": (0.3, 0.7), "temperature": (45, 75), "pressure": (2, 5),
-    },
-    "leak": {
-        "h2s": (10, 30), "co": (100, 300), "ch4": (5, 15), "o2": (17, 19),
-        "flow_rate": (0.6, 1.0), "temperature": (50, 85), "pressure": (1.5, 4.0),
+        "h2s": (25, 80), "co": (30, 120), "co2": (800, 5000), "ch4": (5, 15), "o2": (16, 19),
+        "flow_rate": (0.3, 0.8), "temperature": (55, 95), "pressure": (2.5, 5.5),
+        "humidity": (55, 85),
     },
 }
+
+DEVICES = [
+    {"device_id": "ESP32-001", "name": "Pipe Section A - Inlet", "type": "ESP32", "location": "Unit 12, Pipe A", "ip_address": "192.168.1.101"},
+    {"device_id": "ESP32-002", "name": "Pipe Section B - Mid", "type": "ESP32", "location": "Unit 12, Pipe B", "ip_address": "192.168.1.102"},
+    {"device_id": "ESP32-003", "name": "Pipe Section C - Outlet", "type": "ESP32", "location": "Unit 12, Pipe C", "ip_address": "192.168.1.103"},
+]
 
 
 def generate_reading(mode: str) -> dict:
@@ -40,12 +39,27 @@ def generate_reading(mode: str) -> dict:
     return {
         "h2s": round(random.uniform(*r["h2s"]), 2),
         "co": round(random.uniform(*r["co"]), 2),
+        "co2": round(random.uniform(*r["co2"]), 1),
         "ch4": round(random.uniform(*r["ch4"]), 2),
         "o2": round(random.uniform(*r["o2"]), 2),
         "flow_rate": round(random.uniform(*r["flow_rate"]), 3),
         "temperature": round(random.uniform(*r["temperature"]), 1),
         "pressure": round(random.uniform(*r["pressure"]), 2),
+        "humidity": round(random.uniform(*r["humidity"]), 1),
     }
+
+
+async def seed_devices(url: str) -> None:
+    """Register demo devices."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        for i, dev in enumerate(DEVICES):
+            status = "online" if i < 2 else "offline"
+            dev_copy = {**dev, "status": status}
+            try:
+                await client.post(f"{url}/api/devices/heartbeat", json=dev_copy)
+                print(f"  Registered device: {dev['name']} ({status})")
+            except httpx.RequestError as e:
+                print(f"  Error registering {dev['name']}: {e}")
 
 
 async def seed_days(days: int, url: str) -> None:
@@ -56,8 +70,11 @@ async def seed_days(days: int, url: str) -> None:
     total = int(days * 86400 / interval_seconds)
 
     print(f"Seeding {total} readings over {days} days...")
+    print("Registering devices...")
+    await seed_devices(url)
 
-    modes = ["normal"] * 70 + ["corrosion"] * 15 + ["fouling"] * 10 + ["leak"] * 5
+    # 80% normal, 20% corrosion
+    modes = ["normal"] * 80 + ["corrosion"] * 20
     batch_size = 100
     async with httpx.AsyncClient(timeout=30) as client:
         for i in range(total):
@@ -84,13 +101,16 @@ async def seed_days(days: int, url: str) -> None:
 async def live_stream(mode: str, interval: float, duration: float | None, url: str) -> None:
     """Send readings in real time."""
     print(f"Streaming '{mode}' readings every {interval}s to {url}")
+    print("Sending device heartbeats...")
+    await seed_devices(url)
+
     elapsed = 0.0
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
             reading = generate_reading(mode)
             try:
                 resp = await client.post(f"{url}/api/ingest", json=reading)
-                print(f"[{mode}] h2s={reading['h2s']} co={reading['co']} → {resp.status_code}")
+                print(f"[{mode}] h2s={reading['h2s']} co={reading['co']} temp={reading['temperature']} hum={reading['humidity']} -> {resp.status_code}")
             except httpx.RequestError as e:
                 print(f"Error: {e}")
 
@@ -103,7 +123,7 @@ async def live_stream(mode: str, interval: float, duration: float | None, url: s
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Corrosion Gas Monitor Simulator")
-    parser.add_argument("--mode", choices=["normal", "corrosion", "fouling", "leak"], default="normal")
+    parser.add_argument("--mode", choices=["normal", "corrosion"], default="normal")
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between readings")
     parser.add_argument("--duration", type=float, default=None, help="Total seconds to run")
     parser.add_argument("--url", default="http://localhost:8000", help="Backend URL")

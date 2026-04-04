@@ -7,7 +7,9 @@ const api = axios.create({
 
 export const getReadings = (params = {}) => api.get('/readings', { params }).then(r => r.data)
 export const getDiagnostics = (params = {}) => api.get('/diagnostics', { params }).then(r => r.data)
+export const getRULHistory = (params = {}) => api.get('/diagnostics/rul-history', { params }).then(r => r.data)
 export const getAlerts = (params = {}) => api.get('/alerts', { params }).then(r => r.data)
 export const getStats = () => api.get('/stats').then(r => r.data)
+export const getDevices = () => api.get('/devices').then(r => r.data)
 
 export default api

@@ -22,9 +22,11 @@ async def init_db() -> None:
                 co REAL NOT NULL,
                 ch4 REAL NOT NULL,
                 o2 REAL NOT NULL,
+                co2 REAL,
                 flow_rate REAL,
                 temperature REAL,
-                pressure REAL
+                pressure REAL,
+                humidity REAL
             );
             CREATE INDEX IF NOT EXISTS idx_readings_ts ON sensor_readings(timestamp);
 
@@ -34,6 +36,8 @@ async def init_db() -> None:
                 condition TEXT NOT NULL,
                 rul_days REAL,
                 confidence REAL,
+                corrosion_rate REAL,
+                health_score REAL,
                 model_version TEXT DEFAULT 'xgb-v1'
             );
             CREATE INDEX IF NOT EXISTS idx_diag_ts ON diagnostics(timestamp);
@@ -47,6 +51,17 @@ async def init_db() -> None:
                 acknowledged INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp);
+
+            CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                type TEXT DEFAULT 'ESP32',
+                location TEXT,
+                status TEXT DEFAULT 'offline',
+                last_seen TEXT,
+                ip_address TEXT
+            );
         """)
         await db.commit()
     finally:
@@ -57,8 +72,8 @@ async def insert_reading(data: dict[str, Any]) -> int:
     db = await get_db()
     try:
         cursor = await db.execute(
-            """INSERT INTO sensor_readings (h2s, co, ch4, o2, flow_rate, temperature, pressure)
-               VALUES (:h2s, :co, :ch4, :o2, :flow_rate, :temperature, :pressure)""",
+            """INSERT INTO sensor_readings (h2s, co, ch4, o2, co2, flow_rate, temperature, pressure, humidity)
+               VALUES (:h2s, :co, :ch4, :o2, :co2, :flow_rate, :temperature, :pressure, :humidity)""",
             data,
         )
         await db.commit()
@@ -71,8 +86,8 @@ async def insert_reading_with_timestamp(data: dict[str, Any]) -> int:
     db = await get_db()
     try:
         cursor = await db.execute(
-            """INSERT INTO sensor_readings (timestamp, h2s, co, ch4, o2, flow_rate, temperature, pressure)
-               VALUES (:timestamp, :h2s, :co, :ch4, :o2, :flow_rate, :temperature, :pressure)""",
+            """INSERT INTO sensor_readings (timestamp, h2s, co, ch4, o2, co2, flow_rate, temperature, pressure, humidity)
+               VALUES (:timestamp, :h2s, :co, :ch4, :o2, :co2, :flow_rate, :temperature, :pressure, :humidity)""",
             data,
         )
         await db.commit()
@@ -85,8 +100,8 @@ async def insert_diagnostic(data: dict[str, Any]) -> int:
     db = await get_db()
     try:
         cursor = await db.execute(
-            """INSERT INTO diagnostics (condition, rul_days, confidence)
-               VALUES (:condition, :rul_days, :confidence)""",
+            """INSERT INTO diagnostics (condition, rul_days, confidence, corrosion_rate, health_score)
+               VALUES (:condition, :rul_days, :confidence, :corrosion_rate, :health_score)""",
             data,
         )
         await db.commit()
@@ -105,6 +120,33 @@ async def insert_alert(data: dict[str, Any]) -> int:
         )
         await db.commit()
         return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def upsert_device(data: dict[str, Any]) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO devices (device_id, name, type, location, status, last_seen, ip_address)
+               VALUES (:device_id, :name, :type, :location, :status, :last_seen, :ip_address)
+               ON CONFLICT(device_id) DO UPDATE SET
+                   status = :status,
+                   last_seen = :last_seen,
+                   ip_address = :ip_address""",
+            data,
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_devices() -> list[dict]:
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT * FROM devices ORDER BY name")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
     finally:
         await db.close()
 
@@ -139,6 +181,19 @@ async def get_diagnostics_list(limit: int = 1) -> list[dict]:
     try:
         cursor = await db.execute(
             "SELECT * FROM diagnostics ORDER BY timestamp DESC LIMIT ?", (limit,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def get_rul_history(limit: int = 100) -> list[dict]:
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT timestamp, rul_days, corrosion_rate, health_score FROM diagnostics ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -190,6 +245,12 @@ async def get_stats() -> dict:
         cursor = await db.execute("SELECT COUNT(*) as cnt FROM alerts")
         a = await cursor.fetchone()
 
+        cursor = await db.execute("SELECT COUNT(*) as cnt FROM devices WHERE status = 'online'")
+        dev_online = await cursor.fetchone()
+
+        cursor = await db.execute("SELECT COUNT(*) as cnt FROM devices")
+        dev_total = await cursor.fetchone()
+
         days_of_data = 0.0
         if r["oldest_reading"] and r["newest_reading"]:
             from datetime import datetime
@@ -200,15 +261,18 @@ async def get_stats() -> dict:
 
         db_size_mb = DB_PATH.stat().st_size / (1024 * 1024) if DB_PATH.exists() else 0
 
+        days_rounded = round(days_of_data, 1)
         return {
             "total_readings": r["total_readings"],
             "total_diagnostics": d["cnt"],
             "total_alerts": a["cnt"],
             "oldest_reading": r["oldest_reading"],
             "newest_reading": r["newest_reading"],
-            "days_of_data": round(days_of_data, 1),
+            "days_of_data": days_rounded,
             "db_size_mb": round(db_size_mb, 1),
-            "spec_s8_met": days_of_data >= 10,
+            "spec_s8_met": days_rounded >= 10,
+            "devices_online": dev_online["cnt"],
+            "devices_total": dev_total["cnt"],
         }
     finally:
         await db.close()

@@ -16,13 +16,14 @@ const TIME_RANGES = [
 const SERIES = [
   { key: 'h2s', color: '#f59e0b', label: 'H\u2082S (ppm)' },
   { key: 'co', color: '#3b82f6', label: 'CO (ppm)' },
+  { key: 'co2', color: '#f43f5e', label: 'CO\u2082 (ppm)' },
   { key: 'ch4', color: '#8b5cf6', label: 'CH\u2084 (% LEL)' },
   { key: 'o2', color: '#06b6d4', label: 'O\u2082 (% v/v)' },
 ]
 
 export default function HistoryChart() {
   const [rangeIdx, setRangeIdx] = useState(0)
-  const [visible, setVisible] = useState({ h2s: true, co: true, ch4: true, o2: true })
+  const [visible, setVisible] = useState({ h2s: true, co: true, co2: true, ch4: true, o2: true })
   const range = TIME_RANGES[rangeIdx]
 
   const since = new Date(Date.now() - range.hours * 3600 * 1000).toISOString()

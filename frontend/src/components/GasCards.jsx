@@ -6,6 +6,7 @@ import { getReadings } from '../lib/api'
 const GASES = [
   { key: 'h2s', label: 'H\u2082S', unit: 'ppm', warn: 20, crit: 40, color: '#f59e0b' },
   { key: 'co', label: 'CO', unit: 'ppm', warn: 50, crit: 150, color: '#3b82f6' },
+  { key: 'co2', label: 'CO\u2082', unit: 'ppm', warn: 1000, crit: 5000, color: '#f43f5e' },
   { key: 'ch4', label: 'CH\u2084', unit: '% LEL', warn: 10, crit: 20, color: '#8b5cf6' },
   { key: 'o2', label: 'O\u2082', unit: '% v/v', warn: 19.5, crit: 18, color: '#06b6d4', invert: true },
 ]
@@ -21,6 +22,17 @@ function getStatusColor(value, gas) {
   return 'text-green-400'
 }
 
+function getStatusDot(value, gas) {
+  if (gas.invert) {
+    if (value < gas.crit) return 'bg-red-500'
+    if (value < gas.warn) return 'bg-amber-500'
+    return 'bg-green-500'
+  }
+  if (value >= gas.crit) return 'bg-red-500'
+  if (value >= gas.warn) return 'bg-amber-500'
+  return 'bg-green-500'
+}
+
 export default function GasCards() {
   const fetchReadings = useCallback(() => getReadings({ limit: 60 }), [])
   const { data: readings, loading } = usePolling(fetchReadings, 2000)
@@ -29,7 +41,7 @@ export default function GasCards() {
     return (
       <div className="grid grid-cols-2 gap-3">
         {GASES.map(g => (
-          <div key={g.key} className="bg-gray-900 border border-gray-800 rounded-lg p-4 animate-pulse h-32" />
+          <div key={g.key} className="bg-gray-900 border border-gray-800 rounded-lg p-4 animate-pulse h-36" />
         ))}
       </div>
     )
@@ -42,10 +54,14 @@ export default function GasCards() {
       {GASES.map(gas => {
         const current = readings[0]?.[gas.key] ?? 0
         const color = getStatusColor(current, gas)
+        const dot = getStatusDot(current, gas)
         return (
           <div key={gas.key} className="bg-gray-900 border border-gray-800 rounded-lg p-4">
             <div className="flex items-center justify-between mb-1">
-              <span className="text-sm text-gray-400">{gas.label}</span>
+              <div className="flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${dot}`} />
+                <span className="text-sm text-gray-400">{gas.label}</span>
+              </div>
               <span className="text-xs text-gray-500">{gas.unit}</span>
             </div>
             <div className={`text-2xl font-bold font-mono ${color}`}>

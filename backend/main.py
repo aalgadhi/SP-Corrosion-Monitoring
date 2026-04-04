@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import init_db
-from routes import ingest, readings, diagnostics, alerts, stats
+from routes import ingest, readings, diagnostics, alerts, stats, devices
 
 
 @asynccontextmanager
@@ -28,3 +28,4 @@ app.include_router(readings.router, prefix="/api")
 app.include_router(diagnostics.router, prefix="/api")
 app.include_router(alerts.router, prefix="/api")
 app.include_router(stats.router, prefix="/api")
+app.include_router(devices.router, prefix="/api")
