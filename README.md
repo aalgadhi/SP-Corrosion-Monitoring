@@ -1,6 +1,6 @@
 # Corrosion Gas Monitor
 
-Real-time dashboard for monitoring corrosion-related gases (H₂S, CO, CH₄, O₂) in refinery piping systems. Uses an XGBoost AI model for pipeline condition classification and Remaining Useful Life (RUL) estimation.
+Real-time dashboard for monitoring corrosion-related gases (H₂S, CO, CO₂ CH₄, O₂) in refinery piping systems. Uses an time-series AI models for pipeline condition classification and Remaining Useful Life (RUL) estimation.
 
 **KFUPM Senior Design Project — Team M056, Term 252**
 
