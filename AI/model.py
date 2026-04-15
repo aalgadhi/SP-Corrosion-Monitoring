@@ -1,20 +1,28 @@
+from __future__ import annotations
+
 import argparse
-import math
+import json
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import DataLoader, Dataset
 
+from runtime import (
+    DEFAULT_EXPORT_PATH,
+    RAW_FEATURE_COLUMNS,
+    RNNRULModel,
+    TransformerRULModel,
+    add_derivative_features,
+    build_artifact_payload,
+    feature_columns_from_raw,
+)
 
-# -----------------------------------------------------------------------------
-# Reproducibility
-# -----------------------------------------------------------------------------
 
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
@@ -23,9 +31,6 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-# -----------------------------------------------------------------------------
-# Feature engineering
-# -----------------------------------------------------------------------------
 @dataclass
 class PreparedData:
     train_x: List[np.ndarray]
@@ -35,32 +40,9 @@ class PreparedData:
     feature_columns: List[str]
     train_segment_ids: List[int]
     test_segment_ids: List[int]
-
-
-def add_derivative_features(df: pd.DataFrame, time_col: str, exclude_cols: List[str]) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Add d(feature)/dt for every candidate feature grouped by segment.
-
-    Important note:
-    We intentionally do NOT create a derivative of RUL_days, because RUL_days is the
-    prediction target and doing so would leak target information into the inputs.
-    """
-    df = df.sort_values(["segment_id", time_col]).copy()
-    candidate_cols = [
-        col for col in df.columns
-        if col not in set(exclude_cols + ["RUL_days"])
-    ]
-
-    dt = df.groupby("segment_id")[time_col].diff().replace(0, np.nan)
-    dt = dt.fillna(1.0)
-
-    derivative_cols = []
-    for col in candidate_cols:
-        deriv_col = f"d_{col}_dt"
-        df[deriv_col] = df.groupby("segment_id")[col].diff().fillna(0.0) / dt
-        derivative_cols.append(deriv_col)
-
-    return df, derivative_cols
+    feature_means: Dict[str, float]
+    feature_stds: Dict[str, float]
+    raw_feature_bounds: Dict[str, Tuple[float, float]]
 
 
 def split_by_segment(df: pd.DataFrame, train_ratio: float = 0.7, seed: int = 42) -> Tuple[List[int], List[int]]:
@@ -75,19 +57,27 @@ def split_by_segment(df: pd.DataFrame, train_ratio: float = 0.7, seed: int = 42)
     return train_ids, test_ids
 
 
-def standardize_from_train(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_cols: List[str], ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def standardize_from_train(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], Dict[str, float]]:
     means = train_df[feature_cols].mean()
-    stds = train_df[feature_cols].std().replace(0, 1.0)
+    stds = train_df[feature_cols].std().replace(0, 1.0).fillna(1.0)
 
     train_df = train_df.copy()
     test_df = test_df.copy()
 
     train_df[feature_cols] = (train_df[feature_cols] - means) / stds
     test_df[feature_cols] = (test_df[feature_cols] - means) / stds
-    return train_df, test_df
+    return train_df, test_df, means.to_dict(), stds.to_dict()
 
 
-def dataframe_to_segment_tensors(df: pd.DataFrame, feature_cols: List[str], time_col: str,) -> Tuple[List[np.ndarray], List[np.ndarray], List[int]]:
+def dataframe_to_segment_tensors(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    time_col: str,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[int]]:
     grouped: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     segment_ids: List[int] = []
@@ -107,22 +97,33 @@ def dataframe_to_segment_tensors(df: pd.DataFrame, feature_cols: List[str], time
 
 def prepare_data(csv_path: str, seed: int = 42) -> PreparedData:
     df = pd.read_csv(csv_path)
-
     time_col = "timestep_month" if "timestep_month" in df.columns else "timestep"
-    exclude_for_derivative = ["segment_id", time_col, "Corrosion_Rate_mm_per_year", "Corrosion_Rate_mm_per_day"]
-    df, derivative_cols = add_derivative_features(df, time_col, exclude_for_derivative)
 
-    base_feature_cols = [
-        col for col in df.columns
-        if col not in {"segment_id", time_col, "RUL_days"}
-    ]
-    feature_cols = [col for col in base_feature_cols if col != "RUL_days"]
+    required_cols = {"segment_id", time_col, "RUL_days", *RAW_FEATURE_COLUMNS}
+    missing = sorted(required_cols.difference(df.columns))
+    if missing:
+        raise ValueError(f"Dataset is missing required columns for exportable live inference: {missing}")
+
+    df = df[["segment_id", time_col, *RAW_FEATURE_COLUMNS, "RUL_days"]].copy()
+    df = df.sort_values(["segment_id", time_col]).copy()
+
+    grouped_frames = []
+    for _, group in df.groupby("segment_id", sort=True):
+        group = add_derivative_features(group, time_col=time_col, raw_feature_columns=RAW_FEATURE_COLUMNS)
+        grouped_frames.append(group)
+    df = pd.concat(grouped_frames, ignore_index=True)
+
+    feature_cols = feature_columns_from_raw(RAW_FEATURE_COLUMNS)
 
     train_ids, test_ids = split_by_segment(df, train_ratio=0.7, seed=seed)
     train_df = df[df["segment_id"].isin(train_ids)].copy()
     test_df = df[df["segment_id"].isin(test_ids)].copy()
 
-    train_df, test_df = standardize_from_train(train_df, test_df, feature_cols)
+    raw_feature_bounds = {
+        col: (float(train_df[col].min()), float(train_df[col].max())) for col in RAW_FEATURE_COLUMNS
+    }
+
+    train_df, test_df, feature_means, feature_stds = standardize_from_train(train_df, test_df, feature_cols)
 
     train_x, train_y, train_segments = dataframe_to_segment_tensors(train_df, feature_cols, time_col)
     test_x, test_y, test_segments = dataframe_to_segment_tensors(test_df, feature_cols, time_col)
@@ -134,8 +135,8 @@ def prepare_data(csv_path: str, seed: int = 42) -> PreparedData:
     print(f"Total rows: {len(df):,}")
     print(f"Total segments: {df['segment_id'].nunique()}")
     print(f"Train segments: {len(train_ids)} | Test segments: {len(test_ids)}")
-    print(f"Original feature count (excluding target/time/id): {len(base_feature_cols) - len(derivative_cols)}")
-    print(f"Derivative features added: {len(derivative_cols)}")
+    print(f"Live raw feature count: {len(RAW_FEATURE_COLUMNS)}")
+    print(f"Derivative features added: {len(feature_cols) - len(RAW_FEATURE_COLUMNS)}")
     print(f"Final feature count: {len(feature_cols)}")
     print(
         "Train length range: "
@@ -156,12 +157,12 @@ def prepare_data(csv_path: str, seed: int = 42) -> PreparedData:
         feature_columns=feature_cols,
         train_segment_ids=train_segments,
         test_segment_ids=test_segments,
+        feature_means=feature_means,
+        feature_stds=feature_stds,
+        raw_feature_bounds=raw_feature_bounds,
     )
 
 
-# -----------------------------------------------------------------------------
-# Datasets
-# -----------------------------------------------------------------------------
 class SegmentSequenceDataset(Dataset):
     def __init__(self, x: Sequence[np.ndarray], y: Sequence[np.ndarray]):
         self.x = list(x)
@@ -193,101 +194,6 @@ def collate_variable_length_batch(batch):
 
     return padded_x, padded_y, lengths, valid_mask
 
-
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 1000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, : x.size(1)]
-
-
-class TransformerRULModel(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        d_model: int = 128,
-        nhead: int = 8,
-        num_layers: int = 3,
-        dim_feedforward: int = 256,
-        dropout: float = 0.1,
-        max_len: int = 1000,
-    ):
-        super().__init__()
-        self.input_projection = nn.Linear(input_dim, d_model)
-        self.positional_encoding = PositionalEncoding(d_model=d_model, max_len=max_len)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.regressor = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, 1),
-        )
-
-    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
-        seq_len = x.size(1)
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
-        )
-        key_padding_mask = None
-        if valid_mask is not None:
-            key_padding_mask = ~valid_mask
-
-        x = self.input_projection(x)
-        x = self.positional_encoding(x)
-        encoded = self.encoder(x, mask=causal_mask, src_key_padding_mask=key_padding_mask)
-        return self.regressor(encoded).squeeze(-1)
-
-
-class RNNRULModel(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.rnn = nn.GRU(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        self.regressor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        packed_output, _ = self.rnn(packed)
-        output, _ = pad_packed_sequence(packed_output, batch_first=True, total_length=x.size(1))
-        return self.regressor(output).squeeze(-1)
-
-
-# -----------------------------------------------------------------------------
-# Training / evaluation
-# -----------------------------------------------------------------------------
 
 def masked_mae_loss(preds: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
     abs_err = torch.abs(preds - targets)
@@ -327,7 +233,6 @@ def train_one_model(
     model_name: str,
 ) -> Dict[str, float]:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
     model.to(device)
 
     for epoch in range(1, epochs + 1):
@@ -381,19 +286,59 @@ def train_one_model(
     return metrics
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+def export_model_artifact(
+    export_path: str | Path,
+    *,
+    model: nn.Module,
+    model_type: str,
+    model_kwargs: Dict[str, int | float],
+    prepared: PreparedData,
+    metrics: Dict[str, float],
+) -> Path:
+    export_path = Path(export_path)
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    model_cpu = model.to("cpu")
+    artifact = build_artifact_payload(
+        model=model_cpu,
+        model_type=model_type,
+        model_kwargs=model_kwargs,
+        feature_columns=prepared.feature_columns,
+        feature_means=prepared.feature_means,
+        feature_stds=prepared.feature_stds,
+        raw_feature_bounds=prepared.raw_feature_bounds,
+        metrics=metrics,
+        model_version=f"{model_type}-rul-seq-v1",
+    )
+    torch.save(artifact, str(export_path))
+
+    metadata_path = export_path.with_suffix(".json")
+    human_metadata = {
+        "model_type": artifact["model_type"],
+        "model_kwargs": artifact["model_kwargs"],
+        "feature_columns": artifact["feature_columns"],
+        "raw_feature_columns": artifact["raw_feature_columns"],
+        "raw_feature_specs": artifact["raw_feature_specs"],
+        "raw_feature_bounds": artifact["raw_feature_bounds"],
+        "metrics": artifact["metrics"],
+        "model_version": artifact["model_version"],
+    }
+    metadata_path.write_text(json.dumps(human_metadata, indent=2), encoding="utf-8")
+    print(f"Exported model artifact: {export_path}")
+    print(f"Exported metadata: {metadata_path}")
+    return export_path
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Transformer and RNN models for corrosion RUL prediction.")
+    parser = argparse.ArgumentParser(description="Train and export sequence models for corrosion RUL prediction.")
     parser.add_argument("--csv", type=str, default="corrosion_dataset_real_rul.csv", help="Path to dataset CSV")
-    parser.add_argument("--epochs", type=int, default=8, help="Number of training epochs per model")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size (segments per batch)")
+    parser.add_argument("--epochs", type=int, default=32, help="Number of training epochs per model")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size (segments per batch)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--accuracy-threshold", type=float, default=180.0, help="Threshold in days for custom accuracy")
+    parser.add_argument("--accuracy-threshold", type=float, default=365.25, help="Threshold in days for custom accuracy")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--export-path", type=str, default=str(DEFAULT_EXPORT_PATH), help="Where to save the exported model artifact")
+    parser.add_argument("--export-model", choices=["best", "transformer", "rnn"], default="best", help="Which trained model to export")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -421,8 +366,24 @@ def main() -> None:
     input_dim = prepared.train_x[0].shape[-1]
     max_seq_len = max(max(len(x) for x in prepared.train_x), max(len(x) for x in prepared.test_x))
 
-    transformer = TransformerRULModel(input_dim=input_dim, max_len=max_seq_len)
-    rnn = RNNRULModel(input_dim=input_dim)
+    transformer_kwargs = {
+        "input_dim": input_dim,
+        "d_model": 64,
+        "nhead": 4,
+        "num_layers": 3,
+        "dim_feedforward": 128,
+        "dropout": 0.2,
+        "max_len": max_seq_len,
+    }
+    rnn_kwargs = {
+        "input_dim": input_dim,
+        "hidden_dim": 128,
+        "num_layers": 3,
+        "dropout": 0.1,
+    }
+
+    transformer = TransformerRULModel(**transformer_kwargs)
+    rnn = RNNRULModel(**rnn_kwargs)
 
     print("\nTraining Transformer model...")
     transformer_metrics = train_one_model(
@@ -458,6 +419,25 @@ def main() -> None:
     print(
         f"RNN-GRU     | MAE: {rnn_metrics['mae']:.4f} | "
         f"Accuracy@{args.accuracy_threshold:.0f}d: {rnn_metrics['accuracy']:.4f}"
+    )
+
+    candidates = {
+        "transformer": (transformer, transformer_kwargs, transformer_metrics),
+        "rnn": (rnn, rnn_kwargs, rnn_metrics),
+    }
+    if args.export_model == "best":
+        selected_name = min(candidates, key=lambda name: candidates[name][2]["mae"])
+    else:
+        selected_name = args.export_model
+
+    selected_model, selected_kwargs, selected_metrics = candidates[selected_name]
+    export_model_artifact(
+        args.export_path,
+        model=selected_model,
+        model_type=selected_name,
+        model_kwargs=selected_kwargs,
+        prepared=prepared,
+        metrics=selected_metrics,
     )
 
 

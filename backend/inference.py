@@ -53,21 +53,49 @@ def predict(
     }
 
 
+def build_external_diagnostic(
+    *,
+    reading,
+    predicted_rul: float,
+    confidence: float | None = None,
+    model_version: str | None = None,
+    timestamp: str | None = None,
+) -> dict:
+    rul_days = max(0.0, float(predicted_rul))
+    resolved_confidence = confidence
+    if resolved_confidence is None:
+        resolved_confidence = min(0.95, max(0.55, 1.0 - (abs(rul_days - 1200.0) / 6000.0)))
+
+    corrosion_rate = _estimate_corrosion_rate(
+        reading.h2s,
+        reading.co,
+        reading.temperature,
+        reading.humidity,
+    )
+    health_score = _compute_health_score(rul_days, corrosion_rate)
+    condition = "corrosion" if rul_days < 365 else "normal"
+
+    return {
+        "timestamp": timestamp,
+        "condition": condition,
+        "rul_days": round(rul_days, 1),
+        "confidence": round(float(resolved_confidence), 2),
+        "corrosion_rate": round(corrosion_rate, 3),
+        "health_score": round(health_score, 1),
+        "model_version": model_version or "sequence-rul-v1",
+    }
+
+
 def _estimate_corrosion_rate(
     h2s: float, co: float,
     temperature: float | None,
     humidity: float | None,
 ) -> float:
-    """Estimate corrosion rate in mm/year based on gas levels and environment."""
     base_rate = 0.05
-    # H2S contribution (major corrosion driver)
     h2s_factor = h2s / 100 * 0.8
-    # CO contribution
     co_factor = co / 300 * 0.3
-    # Temperature accelerates corrosion
     temp = temperature or 60.0
     temp_factor = max(0, (temp - 40) / 60) * 0.4
-    # Humidity accelerates corrosion
     hum = humidity or 50.0
     hum_factor = max(0, (hum - 30) / 70) * 0.3
 
@@ -76,10 +104,7 @@ def _estimate_corrosion_rate(
 
 
 def _compute_health_score(rul_days: float, corrosion_rate: float) -> float:
-    """Compute 0-100 health score from RUL and corrosion rate."""
-    # RUL component (0-70 points): 1825 days (5 years) = full score
     rul_score = min(70, (rul_days / 1825) * 70)
-    # Corrosion rate component (0-30 points): lower is better
     rate_score = max(0, 30 - (corrosion_rate / 2.0) * 30)
     return max(0, min(100, rul_score + rate_score))
 
@@ -94,7 +119,6 @@ def _placeholder_predict(
     pressure: float | None,
     humidity: float | None,
 ) -> dict:
-    # Simplified: only normal vs corrosion
     if h2s > 25 or co > 100 or (o2 is not None and o2 < 18.5):
         condition = "corrosion"
         rul_days = max(30, 365 - (h2s - 20) * 8 - max(0, co - 50) * 1.5)

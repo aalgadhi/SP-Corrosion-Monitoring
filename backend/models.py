@@ -71,3 +71,14 @@ class StatsResponse(BaseModel):
     spec_s8_met: bool
     devices_online: int
     devices_total: int
+
+
+class TelemetryTuple(BaseModel):
+    reading: SensorReading
+    predicted_rul: float = Field(..., ge=0, description="Predicted RUL in days from exported sequence model")
+    model_confidence: float | None = Field(None, ge=0, le=1, description="Optional confidence from logger-side model")
+    model_version: str | None = Field(None, description="Optional exported model version")
+
+
+class TelemetryIngestResponse(IngestResponse):
+    diagnostic_id: int

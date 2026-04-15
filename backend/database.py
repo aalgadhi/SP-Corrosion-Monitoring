@@ -99,10 +99,19 @@ async def insert_reading_with_timestamp(data: dict[str, Any]) -> int:
 async def insert_diagnostic(data: dict[str, Any]) -> int:
     db = await get_db()
     try:
+        payload = {
+            "timestamp": data.get("timestamp"),
+            "condition": data["condition"],
+            "rul_days": data.get("rul_days"),
+            "confidence": data.get("confidence"),
+            "corrosion_rate": data.get("corrosion_rate"),
+            "health_score": data.get("health_score"),
+            "model_version": data.get("model_version", "xgb-v1"),
+        }
         cursor = await db.execute(
-            """INSERT INTO diagnostics (condition, rul_days, confidence, corrosion_rate, health_score)
-               VALUES (:condition, :rul_days, :confidence, :corrosion_rate, :health_score)""",
-            data,
+            """INSERT INTO diagnostics (timestamp, condition, rul_days, confidence, corrosion_rate, health_score, model_version)
+               VALUES (COALESCE(:timestamp, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), :condition, :rul_days, :confidence, :corrosion_rate, :health_score, :model_version)""",
+            payload,
         )
         await db.commit()
         return cursor.lastrowid
