@@ -279,7 +279,7 @@ async def get_stats() -> dict:
             "newest_reading": r["newest_reading"],
             "days_of_data": days_rounded,
             "db_size_mb": round(db_size_mb, 1),
-            "spec_s8_met": days_rounded >= 10,
+            "spec_s8_met": days_rounded >= 90,
             "devices_online": dev_online["cnt"],
             "devices_total": dev_total["cnt"],
         }
